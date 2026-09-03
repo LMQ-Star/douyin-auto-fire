@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date, datetime
 import re
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from playwright.async_api import Locator, Page
 
@@ -13,6 +15,33 @@ class PageOperationError(RuntimeError):
 
 
 RETRY_DELAY_MS = 3_000
+
+
+# The message list is rendered newest-first (data-index=0 is the latest item).
+# Read only direction/time metadata; message contents never leave the page.
+_OUTGOING_MESSAGE_GROUPS_JS = r"""() => {
+  const lists = [...document.querySelectorAll('.messageMessageListlist')];
+  const list = lists.find(element => {
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length;
+  });
+  if (!list) return [];
+  return [...list.querySelectorAll('[data-index]')]
+    .map(item => {
+      const rawIndex = item.getAttribute('data-index');
+      const index = Number.parseInt(rawIndex || '', 10);
+      const timeNode = item.querySelector('[class*="MessageBoxTimetimeLayout"], time, [datetime]');
+      return {
+        index,
+        outgoing: Boolean(item.querySelector('[class*="messageMessageBoxisFromMe"]')),
+        time: timeNode
+          ? (timeNode.getAttribute('datetime') || timeNode.innerText || timeNode.textContent || '').trim()
+          : '',
+      };
+    })
+    .filter(item => Number.isFinite(item.index))
+    .sort((left, right) => left.index - right.index);
+}"""
 
 
 class DouyinChat:
@@ -166,6 +195,25 @@ class DouyinChat:
     async def message_input(self) -> Locator:
         return await first_visible(self.page, MESSAGE_INPUTS, self.timeout_ms)
 
+    async def has_outgoing_message_today(self, timezone: str) -> bool:
+        """Return true only with positive evidence of an outgoing message today.
+
+        Douyin places a time label on the oldest message in each displayed time
+        group. Items are newest-first, so messages before that label belong to
+        the same group. Unknown/missing labels deliberately return false: when
+        the page cannot prove that the user already chatted today, preserving
+        the streak is safer than skipping the send.
+        """
+        try:
+            today = date.today() if not timezone else datetime.now(ZoneInfo(timezone)).date()
+        except ZoneInfoNotFoundError:
+            return False
+        try:
+            rows = await self.page.evaluate(_OUTGOING_MESSAGE_GROUPS_JS)
+        except Exception:
+            return False
+        return _has_outgoing_today_from_rows(rows, today)
+
     async def _confirm_opened(self, name: str, timeout_ms: int | None = None) -> None:
         timeout = timeout_ms if timeout_ms is not None else self.confirm_timeout_ms
         deadline = asyncio.get_running_loop().time() + timeout / 1000
@@ -311,6 +359,56 @@ def _group_count_suffix_matches(actual: str, expected: str) -> bool:
         return True
     pattern = _GROUP_COUNT_SUFFIX_RE_TEMPLATE.format(name=re.escape(expected))
     return re.fullmatch(pattern, actual) is not None
+
+
+def _has_outgoing_today_from_rows(rows: object, today: date) -> bool:
+    if not isinstance(rows, list):
+        return False
+    group_has_outgoing = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        group_has_outgoing = group_has_outgoing or row.get("outgoing") is True
+        time_text = row.get("time")
+        if not isinstance(time_text, str) or not time_text.strip():
+            continue
+        is_today = _message_time_is_today(time_text, today)
+        if is_today is True and group_has_outgoing:
+            return True
+        if is_today is False:
+            # Newest-first: once a group is known to be before today, every
+            # remaining loaded message is older too.
+            return False
+        group_has_outgoing = False
+    return False
+
+
+def _message_time_is_today(value: str, today: date) -> bool | None:
+    text = re.sub(r"\s+", " ", value).strip()
+    if not text:
+        return None
+    if any(marker in text for marker in ("昨天", "前天", "星期", "周")):
+        return False
+    if "刚刚" in text or "分钟前" in text or text.startswith("今天"):
+        return True
+    if re.fullmatch(r"(?:上午|下午|晚上|凌晨)?\s*\d{1,2}:\d{2}", text):
+        return True
+
+    full_date = re.search(r"(?P<year>\d{4})[年/-](?P<month>\d{1,2})[月/-](?P<day>\d{1,2})日?", text)
+    if full_date:
+        return (
+            int(full_date.group("year")),
+            int(full_date.group("month")),
+            int(full_date.group("day")),
+        ) == (today.year, today.month, today.day)
+
+    month_day = re.search(r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日", text)
+    if month_day:
+        return (int(month_day.group("month")), int(month_day.group("day"))) == (
+            today.month,
+            today.day,
+        )
+    return None
 
 
 async def _group_name_matches(locator: Locator, expected: str) -> bool:
