@@ -68,6 +68,14 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
                     try:
                         LOGGER.info("处理好友: %s", alias)
                         await chat.open_target(target.name, retries=task.target_open_retries)
+                        if task.prevent_duplicates and await chat.has_outgoing_message_today(
+                            task.timezone
+                        ):
+                            LOGGER.info("检测到今天已有本人发送的消息，跳过: %s", alias)
+                            results.append(
+                                TargetResult(target=target.name, status="skipped", target_alias=alias)
+                            )
+                            continue
                         if not dry_run:
                             for message_index, message in enumerate(target.messages):
                                 message_id = _message_id(message_index, message)
@@ -136,8 +144,9 @@ async def run(dry_run: bool = False, env_file: str | None = None) -> int:
     _write_results(settings.artifacts_dir, task.task_id, dry_run, results, aliases)
     await _notify_dingtalk(settings, task.task_id, dry_run, results, screenshots)
     succeeded = sum(result.status == "success" for result in results)
+    skipped = sum(result.status == "skipped" for result in results)
     failed = sum(result.status == "failed" for result in results)
-    LOGGER.info("执行结束: 成功 %d，失败 %d", succeeded, failed)
+    LOGGER.info("执行结束: 成功 %d，跳过 %d，失败 %d", succeeded, skipped, failed)
     if fatal_error is not None:
         raise fatal_error
     return 1 if failed else 0
