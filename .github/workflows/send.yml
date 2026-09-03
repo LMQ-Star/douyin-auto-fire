@@ -7,10 +7,11 @@ on:
         description: Only verify login and friends without sending
         type: boolean
         default: false
-  #使用github actions的日程 可以把下面的这三行代码注释删掉  用外部的不用管 
   schedule:
+    # 13:30 UTC = 21:30 Asia/Shanghai / Asia/Taipei
     - cron: "30 13 * * *"
-  #     timezone: "Asia/Shanghai"
+    # Backup trigger: if GitHub drops or delays the primary schedule, retry at 21:45.
+    - cron: "45 13 * * *"
 
 concurrency:
   group: douyin-daily-sender
@@ -106,6 +107,28 @@ jobs:
               encoding="utf-8",
           )
           PY
+      - name: Get local run date
+        id: local-date
+        shell: bash
+        run: echo "value=$(TZ=Asia/Shanghai date +%F)" >> "$GITHUB_OUTPUT"
+      - name: Restore encrypted send history
+        id: send-history
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts/history.json.enc
+          key: douyin-send-history-${{ steps.local-date.outputs.value }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            douyin-send-history-${{ steps.local-date.outputs.value }}-
+      - name: Decrypt previous send history
+        if: steps.send-history.outputs.cache-matched-key != ''
+        shell: bash
+        run: |
+          HISTORY_KEY="$(printf '%s' "$DOUYIN_COOKIE" | sha256sum | cut -d' ' -f1)"
+          export HISTORY_KEY
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -pass env:HISTORY_KEY \
+            -in artifacts/history.json.enc \
+            -out artifacts/history.json
       - name: Run
         shell: bash
         run: |
@@ -114,6 +137,22 @@ jobs:
           else
             python run.py
           fi
+      - name: Encrypt updated send history
+        if: always() && hashFiles('artifacts/history.json') != ''
+        shell: bash
+        run: |
+          HISTORY_KEY="$(printf '%s' "$DOUYIN_COOKIE" | sha256sum | cut -d' ' -f1)"
+          export HISTORY_KEY
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -pass env:HISTORY_KEY \
+            -in artifacts/history.json \
+            -out artifacts/history.json.enc
+      - name: Save encrypted send history
+        if: always() && hashFiles('artifacts/history.json.enc') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts/history.json.enc
+          key: douyin-send-history-${{ steps.local-date.outputs.value }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Upload diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
